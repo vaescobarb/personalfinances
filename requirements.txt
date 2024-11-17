@@ -52,7 +52,6 @@ PyPDF2==3.0.1
 pypdfium2==4.30.0
 python-dateutil==2.9.0.post0
 pytz==2024.2
-pywin32==307
 pyzmq==26.2.0
 reqs==0.0.2
 requests==2.32.3
