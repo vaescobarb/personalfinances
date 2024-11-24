@@ -162,3 +162,5 @@ cython_debug/
 #.idea/
 
 money_manager_data/
+
+certifications.yaml
