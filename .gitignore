@@ -164,3 +164,4 @@ cython_debug/
 money_manager_data/
 
 certifications.yaml
+token_cache.bin
