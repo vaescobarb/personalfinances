@@ -66,3 +66,4 @@ traitlets==5.14.3
 tzdata==2024.2
 urllib3==2.2.3
 wcwidth==0.2.13
+PyYAML
