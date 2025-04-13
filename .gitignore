@@ -165,3 +165,6 @@ money_manager_data/
 
 certifications.yaml
 token_cache.bin
+expenses_visualization.ipynb
+exchange_api_credentials.py
+exchange_rates.json
