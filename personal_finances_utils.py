@@ -198,7 +198,7 @@ def plot_monthly_expenses(df, income_df):
     plt.show()
 
 
-def plot_budget_status(merged_budget, show_percentage=True, month=None):
+def plot_budget_status(merged_budget, show_percentage=True, month=None, exclude_categories=None):
     """
     Plots a horizontal bar chart of budget performance by category/subcategory with color-coded labels and alternating row backgrounds.
     """
@@ -241,6 +241,11 @@ def plot_budget_status(merged_budget, show_percentage=True, month=None):
             )
             x_label = 'Amount Remaining (Currency)'
             is_percentage = False
+
+    # Exclude specified categories
+    if exclude_categories:
+        merged_budget['full_category'] = merged_budget['Category'] + " - " + merged_budget['Subcategory']
+        merged_budget = merged_budget[~merged_budget['full_category'].isin(exclude_categories)]
 
     # Sort and extract
     merged_budget = merged_budget.sort_values('value_to_plot', ascending=True)
