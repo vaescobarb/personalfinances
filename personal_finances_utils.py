@@ -1,3 +1,45 @@
+# --- Budget loading utility ---
+def load_budget_sections(file_path, sheet_name='EXPENSES 2025'):
+    """
+    Load and concatenate regular and irregular budget sections from a budget Excel file.
+
+    Args:
+        file_path (str): Path to the Excel file.
+        sheet_name (str): Name of the sheet to load.
+
+    Returns:
+        pd.DataFrame: Simplified budget DataFrame with cleaned columns.
+    """
+    def extract_section(df, category_idx, total_idx):
+        # Extract relevant columns and rows
+        section = df.iloc[category_idx:total_idx, 1:6]
+        section.columns = section.iloc[0]
+        section = section[1:]
+        section = section.reset_index(drop=True)
+        return section.copy(deep=True)
+
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    # Use DataFrame.map instead of applymap for string cleaning
+    for col in df.select_dtypes(include='object').columns:
+        df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # Find indices for regular and irregular sections
+    category_indices = df[df.iloc[:, 1].astype(str).str.lower() == 'category'].index
+    total_indices = df[df.iloc[:, 2].astype(str).str.lower() == 'total'].index
+
+    if len(category_indices) < 2 or len(total_indices) < 2:
+        raise ValueError("Could not find both regular and irregular sections in the budget file.")
+
+    regular = extract_section(df, category_indices[0], total_indices[0])
+    irregular = extract_section(df, category_indices[1], total_indices[1])
+
+    # Concatenate and clean
+    budget = pd.concat([regular, irregular]).sort_values(by='Category')
+    budget['Category'] = budget['Category'].str.strip()
+    budget['Subcategory'] = budget['Subcategory'].str.strip()
+    budget = budget.rename(columns={'Monthly': 'monthly', 'Annually': 'annually'})
+    budget = budget.reset_index(drop=True)
+    return budget
 # ...existing code...
 
 import pandas as pd

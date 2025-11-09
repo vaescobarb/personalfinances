@@ -27,6 +27,7 @@ from personal_finances_utils import (
     classify_expenses,
     compute_avg_expenses_per_month,
     plot_monthly_expenses_plotly,
+    load_budget_sections,
 )
 
 def main() -> None:
@@ -42,9 +43,11 @@ def main() -> None:
         """
     )
 
-    col1, col2 = st.columns([2, 1])
 
-    uploaded = col1.file_uploader("Upload .xlsx file", type=["xlsx"])
+    col1, col2, col3 = st.columns([2, 1, 1])
+
+    uploaded = col1.file_uploader("Upload expenses .xlsx file", type=["xlsx"])
+    uploaded_budget = col2.file_uploader("Upload budget .xlsx file", type=["xlsx"])
 
     # Offer sample files present in the repo `money_manager_data` if present
     sample_path = Path("money_manager_data")
@@ -54,13 +57,24 @@ def main() -> None:
 
     chosen_sample = None
     if sample_files:
-        chosen_sample = col2.selectbox("Or pick a sample file", ["-- none --"] + sample_files)
+        chosen_sample = col3.selectbox("Or pick a sample expenses file", ["-- none --"] + sample_files)
+
+    # Offer sample budget files if present
+    budget_sample_path = Path("budget_files")
+    budget_sample_files = []
+    if budget_sample_path.exists() and budget_sample_path.is_dir():
+        budget_sample_files = sorted([str(p) for p in budget_sample_path.glob("*.xlsx")])
+
+    chosen_budget_sample = None
+    if budget_sample_files:
+        chosen_budget_sample = col3.selectbox("Or pick a sample budget file", ["-- none --"] + budget_sample_files)
 
     df_expenses = None
     df_income = None
+    df_budget = None
 
+    # Load expenses
     if uploaded is not None:
-        # Save upload to a temporary file and call the loader
         t = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         try:
             t.write(uploaded.read())
@@ -70,9 +84,23 @@ def main() -> None:
             t.close()
     elif chosen_sample and chosen_sample != "-- none --":
         df_expenses, df_income = load_money_manager_file(chosen_sample)
-    else:
-        st.info("Upload an .xlsx file or select a sample to begin.")
+
+    # Load budget
+    if uploaded_budget is not None:
+        t2 = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        try:
+            t2.write(uploaded_budget.read())
+            t2.flush()
+            df_budget = load_budget_sections(t2.name)
+        finally:
+            t2.close()
+    elif chosen_budget_sample and chosen_budget_sample != "-- none --":
+        df_budget = load_budget_sections(chosen_budget_sample)
+
+    if df_expenses is None:
+        st.info("Upload an expenses .xlsx file or select a sample to begin.")
     
+    # Tabs: Averages, Monthly tables, Plot, Budget
     if df_expenses is not None:
         df_expenses = classify_expenses(df_expenses)
         try:
@@ -81,8 +109,32 @@ def main() -> None:
             st.error(f"Failed to compute averages: {e}")
             return
 
-        # Create three tabs: Averages, Monthly tables, Plot
-        tab_avgs, tab_tables, tab_plot = st.tabs(["Averages", "Monthly tables", "Plot"])
+        tab_avgs, tab_tables, tab_plot, tab_budget = st.tabs(["Averages", "Monthly tables", "Plot", "Budget"])
+
+        # --- Tab: Budget ---
+        with tab_budget:
+            st.subheader("Loaded Budget Table")
+            if df_budget is not None:
+                st.dataframe(df_budget, height=800)
+                csv_budget = df_budget.to_csv(index=False).encode("utf-8")
+                st.download_button("Download budget table (CSV)", csv_budget, "budget_table.csv", "text/csv")
+
+                # Aggregate by Category for semi-monthly, monthly, annually columns
+                agg_cols = [c for c in ["Semi-monthly", "monthly", "annually"] if c in df_budget.columns]
+                if agg_cols:
+                    st.subheader("Aggregated Budget by Category")
+                    budget_agg = df_budget.groupby("Category")[agg_cols].sum().reset_index()
+                    st.dataframe(budget_agg, height=660)
+                    # Show total monthly budget for aggregated table
+                    if "monthly" in budget_agg.columns:
+                        total_monthly_agg = budget_agg["monthly"].sum()
+                        st.info(f"Total monthly budget (aggregated): {total_monthly_agg:,.2f}")
+                    csv_agg = budget_agg.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download aggregated budget (CSV)", csv_agg, "budget_aggregated_by_category.csv", "text/csv")
+                else:
+                    st.info("No semi-monthly, monthly, or annually columns found in budget file.")
+            else:
+                st.info("No budget file loaded. Upload or select a budget file to view.")
 
         # --- Tab: Averages ---
         with tab_avgs:
