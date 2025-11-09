@@ -1,3 +1,173 @@
+# ...existing code...
+
+import pandas as pd
+import plotly.graph_objects as go
+
+def compute_avg_expenses_per_month(expenses_df: pd.DataFrame) -> pd.DataFrame:
+    """Return a DataFrame with average expenses per month by Category.
+
+    Produces both averages over the full date range and averages over
+    the months where the category had spending.
+    """
+    if expenses_df.empty:
+        return pd.DataFrame(columns=["Category", "Total", "Months_active", "Months_in_range", "Avg_full_range", "Avg_active_months"]).set_index("Category")
+
+    # Ensure Date and Month columns
+    expenses_df = expenses_df.copy()
+    expenses_df["Date"] = pd.to_datetime(expenses_df["Date"])
+    expenses_df["Month"] = expenses_df["Date"].dt.to_period("M")
+
+    # Determine numeric amount column: prefer 'EUR', then 'Amount'
+    amount_col = None
+    for col in ("EUR", "Amount", "Betrag"):
+        if col in expenses_df.columns:
+            amount_col = col
+            break
+    if amount_col is None:
+        # Fallback: pick first numeric column
+        numeric_cols = expenses_df.select_dtypes(include=["number"]).columns
+        if len(numeric_cols) == 0:
+            raise ValueError("No numeric amount column found in expenses data.")
+        amount_col = numeric_cols[0]
+
+    # Treat expenses as positive numbers for totals
+    expenses_df["_abs_amount"] = expenses_df[amount_col].abs().astype(float)
+
+    # Total per category
+    totals = expenses_df.groupby("Category")["_abs_amount"].sum()
+
+    # Active months per category
+    months_active = expenses_df.groupby("Category")["Month"].nunique()
+
+    # Full months in dataset range
+    month_min = expenses_df["Month"].min().to_timestamp()
+    month_max = expenses_df["Month"].max().to_timestamp()
+    months_in_range = pd.period_range(start=month_min, end=month_max, freq="M")
+    n_months_range = len(months_in_range)
+
+    avg_full = totals / max(n_months_range, 1)
+    avg_active = totals / months_active.replace(0, 1)
+
+    # Build monthly sums matrix (categories x months in full range) to compute mean & std
+    # Ensure months in the full range are present as columns (fill missing with 0)
+    monthly = (
+        expenses_df.groupby(["Category", "Month"])["_abs_amount"].sum().unstack(fill_value=0)
+    )
+
+    # If some months in the full range are missing columns in `monthly`, reindex them
+    all_periods = pd.period_range(start=month_min, end=month_max, freq="M")
+    if not all(p in monthly.columns for p in all_periods):
+        monthly = monthly.reindex(columns=all_periods, fill_value=0)
+
+    mean_per_category = monthly.mean(axis=1)
+    std_per_category = monthly.std(axis=1, ddof=0)
+
+    result = pd.DataFrame(
+        {
+            "Total": totals,
+            "Months_active": months_active,
+            "Months_in_range": n_months_range,
+            "Avg_full_range": avg_full,
+            "Avg_active_months": avg_active,
+            "Mean": mean_per_category,
+            "Dev": std_per_category,
+        }
+    )
+
+    result = result.sort_values("Avg_full_range", ascending=False)
+    return result
+
+def plot_monthly_expenses_plotly(expenses_df: pd.DataFrame, income_df: pd.DataFrame | None, amount_column: str) -> go.Figure:
+    # Ensure Month period and numeric amount
+    exp = expenses_df.copy()
+    exp.loc[:, "Month"] = pd.to_datetime(exp["Date"]).dt.to_period("M")
+
+    # pick amount column (prefer provided, then common names)
+    amt_col = amount_column if amount_column in exp.columns else None
+    if amt_col is None:
+        for c in ("EUR", "Amount", "Betrag"):
+            if c in exp.columns:
+                amt_col = c
+                break
+    if amt_col is None:
+        numeric_cols = exp.select_dtypes(include=["number"]).columns
+        if len(numeric_cols) == 0:
+            raise ValueError("No amount column found for plotting")
+        amt_col = numeric_cols[0]
+
+    exp["_amt"] = exp[amt_col].abs().astype(float)
+
+    # Group by Month and Type (like the util function)
+    if "Type" in exp.columns:
+        monthly_expenses = exp.groupby(["Month", "Type"])["_amt"].sum().unstack(fill_value=0)
+    else:
+        monthly_expenses = exp.groupby(["Month"])["_amt"].sum().to_frame(name="Expenses")
+
+    # Add SAVE from income if available
+    if income_df is not None:
+        inc = income_df.copy()
+        inc.loc[:, "Month"] = pd.to_datetime(inc["Date"]).dt.to_period("M")
+        monthly_income = inc.groupby("Month")[amt_col].sum()
+        total_monthly_exp = monthly_expenses.sum(axis=1) if isinstance(monthly_expenses, pd.DataFrame) else monthly_expenses["Expenses"]
+        monthly_savings = monthly_income - total_monthly_exp
+        monthly_savings = monthly_savings[monthly_savings > 0]
+        monthly_savings.name = "SAVE"
+        monthly_expenses = monthly_expenses.copy()
+        monthly_expenses["SAVE"] = monthly_savings.reindex(monthly_expenses.index)
+
+    # Order columns similar to utilities: NEED, UNKNOWN, WANT, SAVE then others
+    preferred = ["NEED", "UNKNOWN", "WANT", "SAVE"]
+    cols = [c for c in preferred if c in monthly_expenses.columns]
+    cols += [c for c in monthly_expenses.columns if c not in cols]
+    monthly_expenses = monthly_expenses[cols]
+
+    # Build x labels and color mapping
+    x = [str(m) for m in monthly_expenses.index]
+    color_map = {"NEED": "#D62728", "UNKNOWN": "#66B2FF", "WANT": "#FFBF00", "SAVE": "#228B22"}
+
+    fig = go.Figure()
+    for col in monthly_expenses.columns:
+        y = monthly_expenses[col].fillna(0).values
+        fig.add_trace(
+            go.Bar(
+                x=x,
+                y=y,
+                name=str(col),
+                marker_color=color_map.get(col, None),
+                hovertemplate="%{x}<br>%{fullData.name}: %{y:.2f}<extra></extra>",
+            )
+        )
+
+    # Annotations: total per type (staggered like the matplotlib version)
+    category_totals = monthly_expenses.sum(axis=0)
+    annotations = []
+    for i, (etype, total) in enumerate(category_totals.items()):
+        annotations.append(dict(
+            xref="paper",
+            yref="paper",
+            x=0.01,
+            y=1.02 - i * 0.05,
+            xanchor="left",
+            text=f"Total {etype}: {total:.2f}",
+            showarrow=False,
+            font=dict(color=color_map.get(etype, "black"), size=12, family="Arial",),
+            bgcolor="white",
+        ))
+
+    fig.update_layout(
+        barmode="stack",
+        title_text="Monthly Expenses, Income, and Savings",
+        xaxis_title="Month",
+        yaxis_title="Total Amount (EUR)",
+        legend_title_text="Type",
+        annotations=annotations,
+        template="plotly_white",
+        height=600,
+    )
+    fig.update_xaxes(tickangle=45)
+    fig.update_yaxes(showgrid=True)
+
+    return fig
 # personal_finances_utilities
 import pandas as pd
 import matplotlib.pyplot as plt
