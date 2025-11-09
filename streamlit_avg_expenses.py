@@ -115,9 +115,24 @@ def main() -> None:
         with tab_budget:
             st.subheader("Loaded Budget Table")
             if df_budget is not None:
-                st.dataframe(df_budget)
+                st.dataframe(df_budget, height=800)
                 csv_budget = df_budget.to_csv(index=False).encode("utf-8")
                 st.download_button("Download budget table (CSV)", csv_budget, "budget_table.csv", "text/csv")
+
+                # Aggregate by Category for semi-monthly, monthly, annually columns
+                agg_cols = [c for c in ["Semi-monthly", "monthly", "annually"] if c in df_budget.columns]
+                if agg_cols:
+                    st.subheader("Aggregated Budget by Category")
+                    budget_agg = df_budget.groupby("Category")[agg_cols].sum().reset_index()
+                    st.dataframe(budget_agg, height=660)
+                    # Show total monthly budget for aggregated table
+                    if "monthly" in budget_agg.columns:
+                        total_monthly_agg = budget_agg["monthly"].sum()
+                        st.info(f"Total monthly budget (aggregated): {total_monthly_agg:,.2f}")
+                    csv_agg = budget_agg.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download aggregated budget (CSV)", csv_agg, "budget_aggregated_by_category.csv", "text/csv")
+                else:
+                    st.info("No semi-monthly, monthly, or annually columns found in budget file.")
             else:
                 st.info("No budget file loaded. Upload or select a budget file to view.")
 
