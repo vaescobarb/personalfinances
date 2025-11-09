@@ -29,6 +29,7 @@ from personal_finances_utils import (
     plot_monthly_expenses_plotly,
     load_budget_sections,
 )
+from currency_conversion_utils import get_nok_conversion, load_exchange_rates
 
 def main() -> None:
     st.set_page_config(page_title="Average Expenses per Month", layout="wide")
@@ -109,7 +110,63 @@ def main() -> None:
             st.error(f"Failed to compute averages: {e}")
             return
 
-        tab_avgs, tab_tables, tab_plot, tab_budget = st.tabs(["Averages", "Monthly tables", "Plot", "Budget"])
+    tab_avgs, tab_tables, tab_plot, tab_budget, tab_budget_tracker = st.tabs(["Averages", "Monthly tables", "Plot", "Budget", "Budget-Tracker"])
+    # --- Tab: Budget-Tracker ---
+    with tab_budget_tracker:
+        st.subheader("Budget Tracker")
+        import personal_finances_utils as pf_utils
+        # Select year from file
+        if "Year" in df_expenses.columns:
+            years = sorted(df_expenses["Year"].dropna().unique(), reverse=True)
+        elif "Date" in df_expenses.columns:
+            years = sorted(pd.to_datetime(df_expenses["Date"]).dt.year.dropna().unique(), reverse=True)
+        else:
+            years = []
+        target_year = st.selectbox("Select year for budget tracking", years) if years else None
+        if target_year is not None and df_budget is not None:
+            # Prepare summary table
+            df_expenses_year = df_expenses[df_expenses["Date"].dt.year == target_year]
+
+            #################################################################################
+            json_file_path = f'{target_year}_exchange_rates.json'
+            exchange_rates = load_exchange_rates(json_file_path)
+            df_expenses_year.loc[:,'NOK'] = df_expenses_year.apply(get_nok_conversion, axis=1, exchange_rates=exchange_rates)
+            
+            
+            ###############################################
+            summary_table = pf_utils.make_yearly_expense_summary(df_expenses_year, target_year)
+            st.write("Yearly Expense Summary Table:")
+            st.dataframe(summary_table)
+            # Merge with budget
+            merged_budget, missing_combinations = pf_utils.merge_expenses_and_budget(summary_table, df_budget, print_missing=False)
+            st.write("Merged Budget Table:")
+            st.dataframe(merged_budget)
+            if not missing_combinations.empty:
+                st.warning(f"Missing combinations in budget: {missing_combinations.shape[0]}")
+                st.dataframe(missing_combinations)
+            # Calculate over/under expenditure
+            folder_path = None
+            file_name = None
+            over_under_expenditure = pf_utils.calculate_over_under_expenditure(merged_budget, folder_path, file_name, export_xlsx=False)
+            st.write("Over/Under Expenditure Table:")
+            st.dataframe(over_under_expenditure)
+            # Plot budget status
+            st.write("Budget Status Plot:")
+            import matplotlib.pyplot as plt
+            exclude_categories = [
+                'Miete - Miete', 'Food - Groceries', 'Transfer family - Transfer family',
+                'Food - Lunch', 'Transportation - Bus', 'Travel - Venezuela'
+            ]
+            show_percentage = st.checkbox("Show percentage of budget", value=False)
+            month = st.selectbox("Select month for plot (optional)", [None] + [m.replace('_over_under','') for m in over_under_expenditure.columns if m.endswith('_over_under')])
+            valid_month = month if month else None
+            try:
+                pf_utils.plot_budget_status(over_under_expenditure, show_percentage=show_percentage, month=valid_month, exclude_categories=exclude_categories)
+                st.pyplot(plt)
+            except Exception as e:
+                st.error(f"Error plotting budget status: {e}")
+        else:
+            st.info("Please upload/select both expenses and budget files, and select a year.")
 
         # --- Tab: Budget ---
         with tab_budget:
