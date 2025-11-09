@@ -237,13 +237,11 @@ def main() -> None:
                     other_cols = [c for c in pivot.columns if c not in desired_cols]
                     pivot = pivot[desired_cols + other_cols]
 
-                    # Append a 'Total' row by summing numeric columns vertically; set 'dev' and 'median' to NaN
+                    # Append a 'Total' row by summing numeric columns vertically; set 'dev' to NaN
                     totals = pivot.select_dtypes(include=["number"]).sum(axis=0)
                     # ensure dev and median are NaN in totals row if present
                     if "dev" in totals.index:
                         totals["dev"] = np.nan
-                    if "median" in totals.index:
-                        totals["median"] = np.nan
                     totals_df = totals.to_frame().T
                     totals_df.index = ["Total"]
                     pivot = pd.concat([pivot, totals_df], verify_integrity=False)

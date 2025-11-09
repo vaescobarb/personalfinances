@@ -409,6 +409,92 @@ def plot_monthly_expenses(df, income_df):
 
     plt.show()
 
+def make_yearly_expense_summary(df_expenses_year, target_year):
+    import pandas as pd
+    import calendar
+    
+    df = df_expenses_year.copy(deep=True)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Subcategory'] = df.apply(lambda row: row['Category'] if row['Subcategory'] == 'Other' else row['Subcategory'], axis=1)
+    df['Subcategory'] = df['Subcategory'].fillna(df['Category'])
+    df_filtered = df[(df['Date'].dt.year == target_year) & (df['Income/Expense'] == 'Ausg.')]
+    df_filtered['Month'] = df_filtered['Date'].dt.month
+    df_grouped = df_filtered.groupby(['Category', 'Subcategory', 'Month'])['NOK'].sum().reset_index()
+    summary_table = df_grouped.pivot(index=['Category', 'Subcategory'], columns='Month', values='NOK')
+    summary_table = summary_table.fillna(0)
+    summary_table.columns = pd.to_datetime(summary_table.columns, format='%m').strftime('%B')
+    summary_table = summary_table.reset_index()
+    summary_table.index.name = None
+    summary_table['Total'] = summary_table.iloc[:, 2:].sum(axis=1)
+    category_totals = summary_table.groupby('Category').sum(numeric_only=True)
+    category_totals['Subcategory'] = 'Category Total'
+    summary_table = pd.concat([summary_table, category_totals.reset_index()])
+    # Use DataFrame.map instead of applymap for rounding
+    summary_table.iloc[:, 2:] = summary_table.iloc[:, 2:].map(lambda x: round(x, 1))
+    summary_table['Category'] = summary_table['Category'].str.strip()
+    summary_table['Subcategory'] = summary_table['Subcategory'].str.strip()
+    all_months = list(calendar.month_name[1:])
+    for month in all_months:
+        if month not in summary_table.columns:
+            summary_table[month] = 0
+    return summary_table
+
+def merge_expenses_and_budget(summary_table, budget_simplified, print_missing=False):
+    """
+    Merge expenses summary and budget, and optionally print missing combinations.
+    Returns merged_budget and missing_combinations DataFrames.
+    Args:
+        summary_table (pd.DataFrame): Expense summary table.
+        budget_simplified (pd.DataFrame): Simplified budget table.
+        print_missing (bool): If True, prints missing combinations.
+    Returns:
+        tuple: (merged_budget, missing_combinations)
+    """
+    merged_budget = summary_table.merge(budget_simplified, left_on=['Category', 'Subcategory'], right_on=['Category', 'Subcategory'])
+    merged_set = set(zip(merged_budget['Category'], merged_budget['Subcategory']))
+    missing_combinations = budget_simplified[~budget_simplified.set_index(['Category', 'Subcategory']).index.isin(merged_set)]
+    if print_missing:
+        print(f"MISSING COMBINATIONS:\n{missing_combinations}")
+    return merged_budget, missing_combinations
+
+def calculate_over_under_expenditure(merged_budget, folder_path=None, file_name=None, export_xlsx=False):
+    """
+    Calculate over/under expenditure for each month and year remaining, with optional export to Excel.
+    Args:
+        merged_budget (pd.DataFrame): Merged budget DataFrame containing monthly and annual budget columns.
+        folder_path (str, optional): Folder path for saving the Excel file.
+        file_name (str, optional): File name for saving the Excel file.
+        export_xlsx (bool, optional): If True, exports the result to Excel.
+    Returns:
+        pd.DataFrame: Updated DataFrame with over/under expenditure and year remaining columns.
+    """
+    import pandas as pd
+    import calendar
+    from datetime import datetime
+    import os
+    
+    # Step 1: Calculate 'over/under expenditure' for each month using vectorized operations
+    current_month = datetime.now().month
+    months = [str(calendar.month_name[i]) for i in range(1, current_month + 1)]
+    monthly_over_under = - merged_budget[months].subtract(merged_budget['monthly'], axis=0)
+    monthly_over_under.columns = [f'{month}_over_under' for month in months]
+    
+    # Step 2: Concatenate the results back to the original DataFrame
+    merged_budget = pd.concat([merged_budget, monthly_over_under], axis=1)
+    
+    # Step 3: Calculate 'year remaining' efficiently
+    merged_budget['year_remaining'] = merged_budget['annually'] - merged_budget['Total']
+    merged_budget = merged_budget.sort_values(by='Category', ascending=True)
+    
+    # Step 4: Drop month columns
+    merged_budget = merged_budget.drop(columns=months)
+    
+    # Step 5: Optionally export to Excel
+    if export_xlsx and folder_path and file_name:
+        output_path = os.path.join(folder_path, 'budget_status_files', file_name.split('/')[1].split('.')[0] + '_over_under_expenditure.xlsx')
+        merged_budget.to_excel(output_path, index=False, sheet_name='Budget Analysis')
+    
+    return merged_budget
 
 def plot_budget_status(merged_budget, show_percentage=True, month=None, exclude_categories=None):
     """
