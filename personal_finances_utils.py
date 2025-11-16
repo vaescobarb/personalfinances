@@ -45,11 +45,12 @@ def load_budget_sections(file_path, sheet_name='EXPENSES 2025'):
 import pandas as pd
 import plotly.graph_objects as go
 
-def compute_avg_expenses_per_month(expenses_df: pd.DataFrame) -> pd.DataFrame:
-    """Return a DataFrame with average expenses per month by Category.
-
+def compute_avg_expenses_per_month(expenses_df: pd.DataFrame, amount_col: str = None) -> pd.DataFrame:
+    """
+    Return a DataFrame with average expenses per month by Category.
     Produces both averages over the full date range and averages over
     the months where the category had spending.
+    Optionally specify the amount column to use.
     """
     if expenses_df.empty:
         return pd.DataFrame(columns=["Category", "Total", "Months_active", "Months_in_range", "Avg_full_range", "Avg_active_months"]).set_index("Category")
@@ -59,18 +60,18 @@ def compute_avg_expenses_per_month(expenses_df: pd.DataFrame) -> pd.DataFrame:
     expenses_df["Date"] = pd.to_datetime(expenses_df["Date"])
     expenses_df["Month"] = expenses_df["Date"].dt.to_period("M")
 
-    # Determine numeric amount column: prefer 'EUR', then 'Amount'
-    amount_col = None
-    for col in ("EUR", "Amount", "Betrag"):
-        if col in expenses_df.columns:
-            amount_col = col
-            break
+    # Determine numeric amount column
     if amount_col is None:
-        # Fallback: pick first numeric column
-        numeric_cols = expenses_df.select_dtypes(include=["number"]).columns
-        if len(numeric_cols) == 0:
-            raise ValueError("No numeric amount column found in expenses data.")
-        amount_col = numeric_cols[0]
+        for col in ("EUR", "Amount", "Betrag"):
+            if col in expenses_df.columns:
+                amount_col = col
+                break
+        if amount_col is None:
+            # Fallback: pick first numeric column
+            numeric_cols = expenses_df.select_dtypes(include=["number"]).columns
+            if len(numeric_cols) == 0:
+                raise ValueError("No numeric amount column found in expenses data.")
+            amount_col = numeric_cols[0]
 
     # Treat expenses as positive numbers for totals
     expenses_df["_abs_amount"] = expenses_df[amount_col].abs().astype(float)
@@ -409,30 +410,59 @@ def plot_monthly_expenses(df, income_df):
 
     plt.show()
 
-def make_yearly_expense_summary(df_expenses_year, target_year):
+def make_yearly_expense_summary(df_expenses_year, target_year, amount_col: str = 'NOK'):
+    """
+    Create a yearly expense summary pivoted by month for the given year.
+
+    Parameters
+    ----------
+    df_expenses_year : pd.DataFrame
+        DataFrame containing expenses with a 'Date', 'Category', and 'Subcategory' columns.
+    target_year : int
+        Year to filter the expenses for.
+    amount_col : str, optional
+        Column name to use for amounts (e.g., 'NOK' or 'EUR'). Defaults to 'NOK'.
+
+    Returns
+    -------
+    summary_table : pd.DataFrame
+        Pivoted table with index ['Category', 'Subcategory'] and month columns (January..December)
+        plus a 'Total' column. Missing months are filled with 0.
+    """
     import pandas as pd
     import calendar
-    
+
     df = df_expenses_year.copy(deep=True)
     df['Date'] = pd.to_datetime(df['Date'])
-    df['Subcategory'] = df.apply(lambda row: row['Category'] if row['Subcategory'] == 'Other' else row['Subcategory'], axis=1)
+    # Normalize Subcategory: replace explicit 'Other' with Category and fill NA with Category
+    df['Subcategory'] = df.apply(lambda row: row['Category'] if row.get('Subcategory') == 'Other' else row.get('Subcategory'), axis=1)
     df['Subcategory'] = df['Subcategory'].fillna(df['Category'])
+
+    # Filter for target year and expenses
     df_filtered = df[(df['Date'].dt.year == target_year) & (df['Income/Expense'] == 'Ausg.')]
     df_filtered['Month'] = df_filtered['Date'].dt.month
-    df_grouped = df_filtered.groupby(['Category', 'Subcategory', 'Month'])['NOK'].sum().reset_index()
-    summary_table = df_grouped.pivot(index=['Category', 'Subcategory'], columns='Month', values='NOK')
+
+    # Group by Category, Subcategory, Month using the specified amount column
+    if amount_col not in df_filtered.columns:
+        raise KeyError(f"Amount column '{amount_col}' not found in expenses data.")
+
+    df_grouped = df_filtered.groupby(['Category', 'Subcategory', 'Month'])[amount_col].sum().reset_index()
+    summary_table = df_grouped.pivot(index=['Category', 'Subcategory'], columns='Month', values=amount_col)
     summary_table = summary_table.fillna(0)
+    # Convert numeric month columns to month names
     summary_table.columns = pd.to_datetime(summary_table.columns, format='%m').strftime('%B')
     summary_table = summary_table.reset_index()
     summary_table.index.name = None
+    # Total across months (columns after Category and Subcategory)
     summary_table['Total'] = summary_table.iloc[:, 2:].sum(axis=1)
     category_totals = summary_table.groupby('Category').sum(numeric_only=True)
     category_totals['Subcategory'] = 'Category Total'
     summary_table = pd.concat([summary_table, category_totals.reset_index()])
-    # Use DataFrame.map instead of applymap for rounding
-    summary_table.iloc[:, 2:] = summary_table.iloc[:, 2:].map(lambda x: round(x, 1))
-    summary_table['Category'] = summary_table['Category'].str.strip()
-    summary_table['Subcategory'] = summary_table['Subcategory'].str.strip()
+    # Round numeric columns to 1 decimal
+    numeric_cols = summary_table.select_dtypes(include=['number']).columns
+    summary_table[numeric_cols] = summary_table[numeric_cols].round(1)
+    summary_table['Category'] = summary_table['Category'].astype(str).str.strip()
+    summary_table['Subcategory'] = summary_table['Subcategory'].astype(str).str.strip()
     all_months = list(calendar.month_name[1:])
     for month in all_months:
         if month not in summary_table.columns:
@@ -450,11 +480,31 @@ def merge_expenses_and_budget(summary_table, budget_simplified, print_missing=Fa
     Returns:
         tuple: (merged_budget, missing_combinations)
     """
-    merged_budget = summary_table.merge(budget_simplified, left_on=['Category', 'Subcategory'], right_on=['Category', 'Subcategory'])
-    merged_set = set(zip(merged_budget['Category'], merged_budget['Subcategory']))
-    missing_combinations = budget_simplified[~budget_simplified.set_index(['Category', 'Subcategory']).index.isin(merged_set)]
+    # Perform inner merge to get the matched rows
+    merged_budget = summary_table.merge(
+        budget_simplified,
+        left_on=['Category', 'Subcategory'],
+        right_on=['Category', 'Subcategory']
+    )
+
+    # Determine combinations present in budget and in summary (expenses)
+    budget_set = set(zip(budget_simplified['Category'], budget_simplified['Subcategory']))
+    summary_set = set(zip(summary_table['Category'], summary_table['Subcategory']))
+
+    # Missing from budget: combos that appear in the expenses summary but not in the budget
+    missing_in_budget_keys = summary_set - budget_set
+    if missing_in_budget_keys:
+        # Build DataFrame of missing combinations from the summary_table rows
+        mask_missing = summary_table.apply(lambda r: (r['Category'], r['Subcategory']) in missing_in_budget_keys, axis=1)
+        missing_combinations = summary_table[mask_missing].copy()
+    else:
+        # Empty DataFrame with same columns as budget_simplified for consistent output
+        missing_combinations = pd.DataFrame(columns=summary_table.columns)
+
     if print_missing:
-        print(f"MISSING COMBINATIONS:\n{missing_combinations}")
+        print("MISSING COMBINATIONS (in expenses but not in budget):")
+        print(missing_combinations)
+
     return merged_budget, missing_combinations
 
 def calculate_over_under_expenditure(merged_budget, folder_path=None, file_name=None, export_xlsx=False):
@@ -581,3 +631,284 @@ def plot_budget_status(merged_budget, show_percentage=True, month=None, exclude_
 
     plt.subplots_adjust(left=0.3)
     plt.show()
+
+
+def calculate_adaptive_budget(
+    budget_df: pd.DataFrame,
+    spent_by_category: dict | pd.DataFrame,
+    current_month: int,
+    year: int,
+    output_format: str = "csv",
+    output_path: str | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Calculate an adaptive budget for remaining months based on actual spending.
+    
+    This function redistributes the annual budget across remaining months based on 
+    spending to date. The total annual budget for each category remains constant, 
+    but monthly budgets are adjusted downward (never upward) for remaining months.
+    
+    Algorithm:
+    1. Calculate total spent so far for each category
+    2. Calculate remaining annual budget (annual - spent)
+    3. Divide remaining budget across remaining months
+    4. Ensure new monthly budget ≤ original monthly budget (only scales down)
+    
+    Parameters
+    ----------
+    budget_df : pd.DataFrame
+        Budget DataFrame with columns: ['Category', 'Subcategory', 'monthly', 'annually']
+    spent_by_category : dict or pd.DataFrame
+        Spending data. Can be either:
+        - dict: Mapping (category, subcategory) tuples to amounts.
+          Example: {('Food', 'Groceries'): 450.50}
+        - DataFrame: Must have columns ['Category', 'Subcategory', 'Total'] or similar.
+          Will sum the amount column for each category/subcategory combination.
+          Useful for passing merged_budget or summary tables directly.
+    current_month : int
+        Current month number (1-12). E.g., 11 for November.
+    year : int
+        Current year (used for reference/metadata).
+    output_format : str, optional
+        Output format: 'csv', 'jsonl', or None. Default is 'csv'.
+    output_path : str, optional
+        Path to save output file. If None, file is not saved.
+    
+    Returns
+    -------
+    adaptive_budget_df : pd.DataFrame
+        DataFrame with adaptive budgets for remaining months containing:
+        - Category, Subcategory: Category identifiers
+        - original_monthly: Original monthly budget
+        - annually: Annual budget
+        - spent_to_date: Amount spent so far this year
+        - remaining_annual: Annual budget - spent to date
+        - months_remaining: Number of months left in year
+        - adaptive_monthly: New monthly budget for remaining months
+        - reduction_percentage: (original - adaptive) / original * 100
+    
+    metadata : dict
+        Metadata dictionary containing:
+        - current_month, year, months_remaining
+        - total_annual_budget, total_spent, total_remaining
+        - categories_affected (those with reduced budgets)
+    
+    Examples
+    --------
+    >>> budget_df = pd.DataFrame({
+    ...     'Category': ['Food', 'Food', 'Transport'],
+    ...     'Subcategory': ['Groceries', 'Dining', 'Bus'],
+    ...     'monthly': [300, 100, 150],
+    ...     'annually': [3600, 1200, 1800]
+    ... })
+    >>> # Example 1: Using dict
+    >>> spent = {('Food', 'Groceries'): 1500, ('Food', 'Dining'): 400, ('Transport', 'Bus'): 600}
+    >>> adaptive, meta = calculate_adaptive_budget(budget_df, spent, 11, 2025)
+    
+    >>> # Example 2: Using DataFrame
+    >>> spent_df = pd.DataFrame({
+    ...     'Category': ['Food', 'Food', 'Transport'],
+    ...     'Subcategory': ['Groceries', 'Dining', 'Bus'],
+    ...     'Total': [1500, 400, 600]
+    ... })
+    >>> adaptive, meta = calculate_adaptive_budget(budget_df, spent_df, 11, 2025)
+    
+    Notes
+    -----
+    - Only operates "downwards": monthly budget never exceeds original monthly budget
+    - If spending exceeds annual budget for a category, monthly budget becomes 0
+    - Output can be saved as CSV or JSONL for comparison and version control
+    """
+    import json
+    from datetime import datetime
+    
+    # Validate inputs
+    if not isinstance(budget_df, pd.DataFrame):
+        raise TypeError("budget_df must be a pandas DataFrame")
+    
+    required_cols = {'Category', 'Subcategory', 'monthly', 'annually'}
+    missing = required_cols - set(budget_df.columns)
+    if missing:
+        raise ValueError(f"budget_df missing required columns: {missing}")
+    
+    if not (1 <= current_month <= 12):
+        raise ValueError(f"current_month must be 1-12, got {current_month}")
+    
+    # Convert DataFrame to dict if needed
+    if isinstance(spent_by_category, pd.DataFrame):
+        spent_df = spent_by_category.copy()
+        
+        # Find the amount column (prefer 'Total', then 'NOK', 'EUR', 'Amount')
+        amount_col = None
+        for col in ('Total', 'NOK', 'EUR', 'Amount', 'Betrag'):
+            if col in spent_df.columns:
+                amount_col = col
+                break
+        
+        if amount_col is None:
+            raise ValueError(
+                f"spent_by_category DataFrame must have one of these columns: "
+                f"'Total', 'NOK', 'EUR', 'Amount', 'Betrag'. Found: {list(spent_df.columns)}"
+            )
+        
+        # Convert to dict: sum amounts by (Category, Subcategory)
+        spent_by_category = {}
+        for _, row in spent_df.iterrows():
+            cat = row['Category']
+            subcat = row['Subcategory']
+            amount = float(row[amount_col])
+            key = (cat, subcat)
+            spent_by_category[key] = spent_by_category.get(key, 0) + amount
+    elif not isinstance(spent_by_category, dict):
+        raise TypeError(
+            "spent_by_category must be either a dict or pd.DataFrame, "
+            f"got {type(spent_by_category)}"
+        )
+    
+    # Calculate months remaining (including current month)
+    months_remaining = 12 - current_month + 1
+    
+    # Create result DataFrame
+    result = budget_df[['Category', 'Subcategory', 'monthly', 'annually']].copy()
+    result = result.rename(columns={'monthly': 'original_monthly'})
+    
+    # Initialize columns
+    result['spent_to_date'] = 0.0
+    result['remaining_annual'] = result['annually'].astype(float)
+    result['adaptive_monthly'] = result['original_monthly'].astype(float)
+    result['reduction_percentage'] = 0.0
+    
+    # Populate spending data
+    for idx, row in result.iterrows():
+        key = (row['Category'], row['Subcategory'])
+        if key in spent_by_category:
+            spent = float(spent_by_category[key])
+            result.at[idx, 'spent_to_date'] = spent
+            result.at[idx, 'remaining_annual'] = max(0, float(row['annually']) - spent)
+    
+    # Add metadata column
+    result['months_remaining'] = months_remaining
+    
+    # Calculate adaptive monthly budget
+    for idx, row in result.iterrows():
+        spent = row['spent_to_date']
+        annual = float(row['annually'])
+        original_monthly = float(row['original_monthly'])
+        
+        # Calculate what the new monthly budget should be
+        remaining = max(0, annual - spent)
+        new_monthly = remaining / months_remaining if months_remaining > 0 else 0
+        
+        # Ensure it never exceeds original monthly budget
+        adaptive_monthly = min(new_monthly, original_monthly)
+        
+        result.at[idx, 'adaptive_monthly'] = adaptive_monthly
+        
+        # Calculate reduction percentage
+        if original_monthly > 0:
+            reduction = ((original_monthly - adaptive_monthly) / original_monthly) * 100
+            result.at[idx, 'reduction_percentage'] = max(0, reduction)
+    
+    # Reorder columns for clarity
+    result = result[[
+        'Category', 'Subcategory', 'original_monthly', 'annually',
+        'spent_to_date', 'remaining_annual', 'months_remaining',
+        'adaptive_monthly', 'reduction_percentage'
+    ]]
+    
+    # Calculate metadata
+    metadata = {
+        'timestamp': datetime.now().isoformat(),
+        'year': year,
+        'current_month': current_month,
+        'months_remaining': months_remaining,
+        'current_month_name': calendar.month_name[current_month],
+        'total_annual_budget': float(result['annually'].sum()),
+        'total_spent': float(result['spent_to_date'].sum()),
+        'total_remaining': float(result['remaining_annual'].sum()),
+        'categories_affected': result[result['reduction_percentage'] > 0].shape[0],
+        'total_reduction_percentage': float(
+            result[result['annually'] > 0]['reduction_percentage'].mean()
+        ) if len(result) > 0 else 0.0
+    }
+    
+    # Export if requested
+    if output_format and output_path:
+        output_path_with_ext = output_path
+        
+        if output_format.lower() == 'csv':
+            if not output_path.endswith('.csv'):
+                output_path_with_ext = f"{output_path}_{metadata['current_month_name']}_adaptive_budget.csv"
+            result.to_csv(output_path_with_ext, index=False)
+            print(f"✓ Adaptive budget saved to CSV: {output_path_with_ext}")
+            
+        elif output_format.lower() == 'jsonl':
+            if not output_path.endswith('.jsonl'):
+                output_path_with_ext = f"{output_path}_{metadata['current_month_name']}_adaptive_budget.jsonl"
+            
+            # Prepare data for JSONL
+            with open(output_path_with_ext, 'w') as f:
+                # Write metadata as first line
+                f.write(json.dumps({'_metadata': metadata}) + '\n')
+                # Write each row as JSON
+                for _, row in result.iterrows():
+                    row_dict = row.to_dict()
+                    f.write(json.dumps(row_dict) + '\n')
+            
+            print(f"✓ Adaptive budget saved to JSONL: {output_path_with_ext}")
+        
+        else:
+            raise ValueError(f"Unsupported output_format: {output_format}. Use 'csv' or 'jsonl'.")
+    
+    return result, metadata
+
+
+def compare_budgets(
+    original_budget_df: pd.DataFrame,
+    adaptive_budget_df: pd.DataFrame,
+    output_path: str | None = None,
+    output_format: str = "csv",
+) -> pd.DataFrame:
+    """
+    Compare original and adaptive budgets side-by-side.
+    
+    Parameters
+    ----------
+    original_budget_df : pd.DataFrame
+        Original budget DataFrame with 'Category', 'Subcategory', 'monthly' columns.
+    adaptive_budget_df : pd.DataFrame
+        Adaptive budget DataFrame returned from calculate_adaptive_budget.
+    output_path : str, optional
+        Path to save comparison.
+    output_format : str, optional
+        'csv' or 'jsonl'. Default is 'csv'.
+    
+    Returns
+    -------
+    comparison_df : pd.DataFrame
+        Side-by-side comparison with columns for original and adaptive budgets.
+    """
+    import json
+
+    comparison = pd.DataFrame({
+        'Category': adaptive_budget_df['Category'],
+        'Subcategory': adaptive_budget_df['Subcategory'],
+        'original_monthly': adaptive_budget_df['original_monthly'],
+        'adaptive_monthly': adaptive_budget_df['adaptive_monthly'],
+        'monthly_difference': adaptive_budget_df['original_monthly'] - adaptive_budget_df['adaptive_monthly'],
+        'reduction_percent': adaptive_budget_df['reduction_percentage'],
+        'spent_to_date': adaptive_budget_df['spent_to_date'],
+        'remaining_annual': adaptive_budget_df['remaining_annual'],
+    })
+    
+    if output_path:
+        if output_format.lower() == 'csv':
+            comparison.to_csv(output_path, index=False)
+            print(f"✓ Budget comparison saved to: {output_path}")
+        elif output_format.lower() == 'jsonl':
+            with open(output_path, 'w') as f:
+                for _, row in comparison.iterrows():
+                    f.write(json.dumps(row.to_dict()) + '\n')
+            print(f"✓ Budget comparison saved to: {output_path}")
+    
+    return comparison

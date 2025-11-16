@@ -110,7 +110,300 @@ def main() -> None:
             st.error(f"Failed to compute averages: {e}")
             return
 
-    tab_avgs, tab_tables, tab_plot, tab_budget, tab_budget_tracker = st.tabs(["Averages", "Monthly tables", "Plot", "Budget", "Budget-Tracker"])
+    tab_avgs, tab_tables, tab_plot, tab_budget, tab_budget_tracker, tab_adaptive = st.tabs(["Averages", "Monthly tables", "Plot", "Budget", "Budget-Tracker", "Adaptive Budget"])
+    # --- Tab: Adaptive Budget ---
+    with tab_adaptive:
+        st.subheader("Adaptive Budget Calculator")
+        st.markdown(
+            """
+            Calculate adaptive budgets based on your spending so far this year.
+            The adaptive budget adjusts monthly budgets downward for remaining months
+            (never increases) to match your actual spending pace.
+            """
+        )
+        
+        if df_budget is None:
+            st.warning("⚠️ Please upload/select a budget file first to use adaptive budget calculator.")
+        elif df_expenses is None:
+            st.warning("⚠️ Please upload/select an expenses file first.")
+        else:
+            import personal_finances_utils as pf_utils
+            from datetime import datetime, date
+            
+            # Date selection
+            col1, col2, col3 = st.columns([2, 2, 2])
+            
+            with col1:
+                st.markdown("**Current Date (for calculation)**")
+                use_today = st.checkbox("Use today's date", value=True, key="adaptive_use_today")
+                if use_today:
+                    current_date = date.today()
+                    st.info(f"📅 Using today: {current_date.strftime('%Y-%m-%d')}")
+                else:
+                    current_date = st.date_input("Select current date", value=date.today(), key="adaptive_date")
+            
+            with col2:
+                st.markdown("**Or select manually**")
+                if not use_today:
+                    target_year_manual = st.selectbox("Year", range(2020, 2031), index=4, key="adaptive_year")
+                    target_month_manual = st.selectbox("Month", range(1, 13), index=current_date.month - 1, key="adaptive_month")
+                    current_date = date(target_year_manual, target_month_manual, 1)
+                    st.info(f"📅 Selected: {current_date.strftime('%B %Y')}")
+            
+            with col3:
+                st.markdown("**Output Settings**")
+                output_folder = st.text_input(
+                    "Output folder path",
+                    value="./adaptive_budgets",
+                    help="Where to save CSV/JSONL files. Created if doesn't exist."
+                )
+                export_format = st.selectbox(
+                    "Export format",
+                    ["CSV", "JSONL", "Both", "None"],
+                    help="CSV for spreadsheets, JSONL for data pipelines"
+                )
+            
+            # Year and month from current_date
+            target_year = current_date.year
+            target_month = current_date.month
+            
+            st.divider()
+            
+            # Prepare data for adaptive budget
+            if st.button("🧮 Calculate Adaptive Budget", type="primary", use_container_width=True):
+                try:
+                    # Filter expenses for the selected year
+                    df_expenses_year = df_expenses[df_expenses["Date"].dt.year == target_year].copy()
+                    
+                    if df_expenses_year.empty:
+                        st.warning(f"No expense data found for year {target_year}")
+                    else:
+                        # Load exchange rates if needed
+                        json_file_path = f'{target_year}_exchange_rates.json'
+                        try:
+                            exchange_rates = load_exchange_rates(json_file_path)
+                            df_expenses_year.loc[:, 'NOK'] = df_expenses_year.apply(
+                                get_nok_conversion, axis=1, exchange_rates=exchange_rates
+                            )
+                        except:
+                            raise Exception("Failed to load exchange rates.")
+                            #pass  # Continue without NOK conversion if file not found
+                        
+                        # Create yearly summary
+                        summary_table = pf_utils.make_yearly_expense_summary(df_expenses_year, target_year)
+                        
+                        # Merge with budget
+                        merged_budget, missing_combinations = pf_utils.merge_expenses_and_budget(
+                            summary_table, df_budget, print_missing=False
+                        )
+
+                        # Prepare budget DataFrame for adaptive calculation
+                        budget_for_adaptive = df_budget[['Category', 'Subcategory', 'monthly', 'annually']].copy()
+                        budget_for_adaptive = budget_for_adaptive.rename(columns={'monthly': 'monthly', 'annually': 'annually'})
+
+                        # Calculate correct totals for spent by category using the same method as in Averages tab
+                        # Include both merged_budget and missing_combinations (exclude 'Category Total' rows)
+                        spent_totals = merged_budget.groupby(['Category', 'Subcategory'])['Total'].sum().reset_index()
+
+                        # Add missing combinations' totals (from summary) applying exceptions logic:
+                        # For exception categories keep only 'Category Total' rows; for other categories keep non-'Category Total' rows
+                        if not missing_combinations.empty:
+                            exceptions = ['Apparel', 'Household']
+                            mask_exception = missing_combinations['Category'].isin(exceptions)
+                            mask_cat_total = missing_combinations['Subcategory'] == 'Category Total'
+                            missing_filtered = missing_combinations[(mask_exception & mask_cat_total) | (~mask_exception & ~mask_cat_total)].copy()
+
+                            if 'Total' in missing_filtered.columns:
+                                missing_spent = missing_filtered[['Category', 'Subcategory', 'Total']].copy()
+                                spent_totals = pd.concat([spent_totals, missing_spent], ignore_index=True)
+                            else:
+                                # Fallback: if Total column not present, attempt to compute from month columns
+                                month_cols = [c for c in missing_filtered.columns if c not in ('Category', 'Subcategory')]
+                                if month_cols:
+                                    missing_filtered['Total'] = missing_filtered[month_cols].sum(axis=1)
+                                    missing_spent = missing_filtered[['Category', 'Subcategory', 'Total']].copy()
+                                    spent_totals = pd.concat([spent_totals, missing_spent], ignore_index=True)
+
+                        # Aggregate again to ensure uniqueness
+                        spent_totals = spent_totals.groupby(['Category', 'Subcategory'])['Total'].sum().reset_index()
+
+                        # Determine output path and format
+                        if export_format == "None":
+                            output_path = None
+                            format_to_use = None
+                        else:
+                            import os
+                            os.makedirs(output_folder, exist_ok=True)
+                            output_path = os.path.join(output_folder, f"{target_year}_m{target_month:02d}_adaptive")
+                            if export_format == "Both":
+                                format_to_use = "csv"
+                            else:
+                                format_to_use = export_format.lower()
+
+                        # Calculate adaptive budget
+                        adaptive_budget, metadata = pf_utils.calculate_adaptive_budget(
+                            budget_df=budget_for_adaptive,
+                            spent_by_category=spent_totals,
+                            current_month=target_month,
+                            year=target_year,
+                            output_format=format_to_use,
+                            output_path=output_path
+                        )
+
+                        # If "Both" format, also export as JSONL
+                        if export_format == "Both":
+                            adaptive_budget, _ = pf_utils.calculate_adaptive_budget(
+                                budget_df=budget_for_adaptive,
+                                spent_by_category=spent_totals,
+                                current_month=target_month,
+                                year=target_year,
+                                output_format='jsonl',
+                                output_path=output_path
+                            )
+
+                        # Display metrics
+                        st.success("✅ Adaptive budget calculated successfully!")
+                        st.divider()
+
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("📅 Current Month", calendar.month_name[target_month])
+                        col2.metric("⏳ Months Remaining", metadata['months_remaining'])
+                        col3.metric("📊 Categories Affected", metadata['categories_affected'])
+                        col4.metric("📉 Avg Reduction %", f"{metadata['total_reduction_percentage']:.1f}%")
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("💰 Total Annual Budget", f"{metadata['total_annual_budget']:,.2f} NOK")
+                        with col2:
+                            # Prefer to display the aggregated spent total we computed (includes missing combinations)
+                            try:
+                                combined_total_spent = float(spent_totals['Total'].sum())
+                            except Exception:
+                                # fallback to metadata if spent_totals is not available for some reason
+                                combined_total_spent = metadata.get('total_spent', 0.0)
+                            st.metric("💸 Total Spent", f"{combined_total_spent:,.2f} NOK")
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("📈 Total Remaining", f"{metadata['total_remaining']:,.2f} NOK")
+                        with col2:
+                            st.metric("🎯 Calculation Date", current_date.strftime('%Y-%m-%d'))
+                        
+                        st.divider()
+                        
+                        # Show the adaptive budget table
+                        st.subheader("Adaptive Budget Details")
+                        
+                        # Format the display
+                        display_df = adaptive_budget.copy()
+                        display_df = display_df.round(2)
+                        
+                        st.dataframe(
+                            display_df,
+                            use_container_width=True,
+                            height=600,
+                            column_config={
+                                "Category": st.column_config.TextColumn("Category", width="medium"),
+                                "Subcategory": st.column_config.TextColumn("Subcategory", width="medium"),
+                                "original_monthly": st.column_config.NumberColumn("Original Monthly", format="%.2f NOK"),
+                                "annually": st.column_config.NumberColumn("Annual", format="%.2f NOK"),
+                                "spent_to_date": st.column_config.NumberColumn("Spent So Far", format="%.2f NOK"),
+                                "remaining_annual": st.column_config.NumberColumn("Remaining Annual", format="%.2f NOK"),
+                                "months_remaining": st.column_config.NumberColumn("Months Left"),
+                                "adaptive_monthly": st.column_config.NumberColumn("Adaptive Monthly", format="%.2f NOK"),
+                                "reduction_percentage": st.column_config.NumberColumn("Reduction %", format="%.1f%%"),
+                            }
+                        )
+                        
+                        # Display missing combinations if any, applying the same exceptions logic
+                        if not missing_combinations.empty:
+                            exceptions = ['Apparel', 'Household']
+                            mask_exception = missing_combinations['Category'].isin(exceptions)
+                            mask_cat_total = missing_combinations['Subcategory'] == 'Category Total'
+                            missing_display = missing_combinations[(mask_exception & mask_cat_total) | (~mask_exception & ~mask_cat_total)].copy()
+                            st.subheader("⚠️ Missing Combinations in Budget")
+                            st.warning(f"The following category/subcategory combinations are in your expenses but not in the budget: {missing_display.shape[0]} combinations (Category Total kept for exceptions)")
+                            if not missing_display.empty:
+                                st.dataframe(missing_display, use_container_width=True)
+                            else:
+                                st.info("No missing combinations to display after applying exceptions filter.")
+                        
+                        st.divider()
+                        
+                        # Download buttons
+                        st.subheader("📥 Download Results")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            csv_data = adaptive_budget.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label="📥 Download as CSV",
+                                data=csv_data,
+                                file_name=f"adaptive_budget_{target_year}_m{target_month:02d}.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+                        
+                        with col2:
+                            import json
+                            jsonl_lines = [json.dumps({"_metadata": metadata})]
+                            jsonl_lines.extend([json.dumps(row.to_dict()) for _, row in adaptive_budget.iterrows()])
+                            jsonl_data = '\n'.join(jsonl_lines).encode('utf-8')
+                            st.download_button(
+                                label="📥 Download as JSONL",
+                                data=jsonl_data,
+                                file_name=f"adaptive_budget_{target_year}_m{target_month:02d}.jsonl",
+                                mime="text/plain",
+                                use_container_width=True
+                            )
+                        
+                        with col3:
+                            # Export path info
+                            if export_path := output_path:
+                                st.info(f"💾 Files also saved to:\n`{export_path}`")
+                        
+                        # Show categories with significant cuts
+                        st.divider()
+                        st.subheader("📍 Budget Adjustments Summary")
+                        
+                        affected = adaptive_budget[adaptive_budget['reduction_percentage'] > 0].sort_values(
+                            'reduction_percentage', ascending=False
+                        )
+                        
+                        if affected.empty:
+                            st.success("✅ No budget cuts needed - you're on track!")
+                        else:
+                            if len(affected) <= 5:
+                                st.dataframe(
+                                    affected[['Category', 'Subcategory', 'original_monthly', 'adaptive_monthly', 'reduction_percentage']],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    column_config={
+                                        "original_monthly": st.column_config.NumberColumn("Original Monthly", format="%.2f NOK"),
+                                        "adaptive_monthly": st.column_config.NumberColumn("Adaptive Monthly", format="%.2f NOK"),
+                                        "reduction_percentage": st.column_config.NumberColumn("Reduction %", format="%.1f%%"),
+                                    }
+                                )
+                            else:
+                                st.write(f"Categories with budget cuts ({len(affected)}):")
+                                st.dataframe(
+                                    affected[['Category', 'Subcategory', 'original_monthly', 'adaptive_monthly', 'reduction_percentage']],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=300,
+                                    column_config={
+                                        "original_monthly": st.column_config.NumberColumn("Original Monthly", format="%.2f NOK"),
+                                        "adaptive_monthly": st.column_config.NumberColumn("Adaptive Monthly", format="%.2f NOK"),
+                                        "reduction_percentage": st.column_config.NumberColumn("Reduction %", format="%.1f%%"),
+                                    }
+                                )
+                
+                except Exception as e:
+                    st.error(f"❌ Error calculating adaptive budget: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
+    
     # --- Tab: Budget-Tracker ---
     with tab_budget_tracker:
         st.subheader("Budget Tracker")
@@ -197,18 +490,119 @@ def main() -> None:
         with tab_avgs:
             st.subheader("Average expenses per month (by category)")
             st.write(
-                "The table shows total spending, months active, number of months in the full range, and two averages."
+                "Select a year and currency to view average expenses per month by category. The table shows total spending, months active, number of months in the full range, and two averages."
             )
 
-            st.dataframe(result.style.format({"Total": "{:.2f}", "Avg_full_range": "{:.2f}", "Avg_active_months": "{:.2f}"}))
+            # Year selection
+            years = sorted(df_expenses["Date"].dt.year.unique(), reverse=True)
+            selected_year = st.selectbox("Select year", years, index=0)
+
+            # Currency selection
+            currency_option = st.selectbox("Select currency", ["EUR", "NOK"], index=0)
+
+            # Filter expenses for selected year
+            df_year = df_expenses[df_expenses["Date"].dt.year == selected_year].copy()
+
+            # Apply currency conversion if NOK selected
+            amount_col = None
+            for col in ("EUR", "Amount", "Betrag"):
+                if col in df_year.columns:
+                    amount_col = col
+                    break
+            if amount_col is None:
+                numeric_cols = df_year.select_dtypes(include=["number"]).columns
+                if len(numeric_cols) == 0:
+                    st.error("No numeric amount column found for averages table.")
+                    return
+                amount_col = numeric_cols[0]
+
+            if currency_option == "NOK":
+                json_file_path = f'{selected_year}_exchange_rates.json'
+                try:
+                    exchange_rates = load_exchange_rates(json_file_path)
+                    df_year["NOK"] = df_year.apply(get_nok_conversion, axis=1, exchange_rates=exchange_rates)
+                    used_col = "NOK"
+                except Exception as e:
+                    st.error(f"Failed to load exchange rates for NOK conversion: {e}")
+                    return
+            else:
+                used_col = amount_col
+
+            # Compute averages for selected year and currency
+            try:
+                result_year = compute_avg_expenses_per_month(df_year, amount_col=used_col)
+            except Exception as e:
+                st.error(f"Failed to compute averages: {e}")
+                return
+
+            # Report total expenses for selected year and currency
+            total_expenses = df_year[used_col].abs().sum()
+            st.info(f"Total expenses for {selected_year} ({currency_option}): {total_expenses:,.2f}")
+
+            st.dataframe(result_year.style.format({"Total": "{:.2f}", "Avg_full_range": "{:.2f}", "Avg_active_months": "{:.2f}"}))
+
+            st.subheader("Average expenses by Category and Subcategory")
+            # Use make_yearly_expense_summary to build detailed subcategory view
+            import personal_finances_utils as pf_utils
+
+            try:
+                summary_table = pf_utils.make_yearly_expense_summary(df_year, selected_year, amount_col=used_col)
+            except Exception as e:
+                st.error(f"Failed to build yearly summary: {e}")
+                summary_table = pd.DataFrame()
+
+            if not summary_table.empty:
+                # Months in year (January..December)
+                all_months = list(calendar.month_name[1:])
+
+                # Compute months in range from the data
+                month_min = pd.to_datetime(df_year['Date']).dt.to_period('M').min().to_timestamp()
+                month_max = pd.to_datetime(df_year['Date']).dt.to_period('M').max().to_timestamp()
+                months_in_range = len(pd.period_range(start=month_min, end=month_max, freq='M'))
+
+                detailed_summary = summary_table.copy()
+                # Months active (count of months with spending)
+                detailed_summary['Months_Active'] = (detailed_summary[all_months] > 0).sum(axis=1)
+
+                # Transaction counts from raw data
+                tx_counts = df_year.groupby(['Category', 'Subcategory']).size().reset_index(name='Transaction_Count')
+                detailed_summary = detailed_summary.merge(tx_counts, on=['Category', 'Subcategory'], how='left')
+                detailed_summary['Transaction_Count'] = detailed_summary['Transaction_Count'].fillna(0).astype(int)
+
+                detailed_summary['Avg_full_range'] = detailed_summary['Total'] / max(months_in_range, 1)
+                detailed_summary['Avg_active_months'] = detailed_summary['Total'] / detailed_summary['Months_Active'].replace(0, 1)
+                detailed_summary = detailed_summary.sort_values('Total', ascending=False)
+
+                # Exclude 'Category Total' rows except for specific categories
+                exceptions = ['Apparel', 'Household']
+                mask_exception = detailed_summary['Category'].isin(exceptions)
+                mask_cat_total = detailed_summary['Subcategory'] == 'Category Total'
+                # For exception categories, keep only the 'Category Total' row;
+                # for other categories, keep only rows that are not 'Category Total'.
+                filtered_summary = detailed_summary[(mask_exception & mask_cat_total) | (~mask_exception & ~mask_cat_total)].copy()
+
+                # Compute total expenses for the filtered table
+                total_for_table = filtered_summary['Total'].sum()
+                st.info(f"Total (Category+Subcategory table) for {selected_year} ({currency_option}): {total_for_table:,.2f}")
+
+                st.dataframe(
+                    filtered_summary.style.format({
+                        'Total': '{:.2f}',
+                        'Avg_full_range': '{:.2f}',
+                        'Avg_active_months': '{:.2f}'
+                    }),
+                    use_container_width=True
+                )
+            else:
+                st.info('No summary data available for the selected year/currency.')
 
             st.subheader("Bar chart: Average (full range)")
-            chart_data = result[["Avg_full_range"]].rename(columns={"Avg_full_range": "Avg per month (full range)"})
+            chart_data = result_year[["Avg_full_range"]].rename(columns={"Avg_full_range": f"Avg per month (full range) ({currency_option})"})
             st.bar_chart(chart_data)
 
             # CSV download
-            csv = result.reset_index().to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, "avg_expenses_by_category.csv", "text/csv")
+            csv = result_year.reset_index().to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", csv, f"avg_expenses_by_category_{selected_year}_{currency_option}.csv", "text/csv")
 
         # --- Tab: Monthly tables ---
         with tab_tables:
